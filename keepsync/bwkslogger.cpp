@@ -1,0 +1,562 @@
+#include "bwkslogger.h"
+
+BWKSLogger::BWKSLogger(BWConfig &cfg) {
+    m_cfg = cfg;
+
+    try {
+        init();
+    }
+    catch (BWError &e) {
+        m_log(BWLog::MSG_ERROR) << "Erro ao iniciar objeto BWKSLogger" 
+                                << bwlog::endl;
+        throw e;
+    }
+}
+
+BWKSLogger::~BWKSLogger() {
+    delete m_transaction;
+    delete m_ksdb;
+    delete m_appdb;
+}
+
+void BWKSLogger::init() {
+    m_ksdb = bwdb_load(m_cfg["ksdb"]);
+    m_appdb = bwdb_load(m_cfg["appdb"], true);
+
+    loadDbs();
+
+    m_transaction = new BWKSTransaction(m_cfg);
+}
+
+void BWKSLogger::loadDbs() {
+    BWList logs;
+
+    if (m_cfg["logs"] != "(null)" && m_cfg["logs"] != "") {
+
+        logs = m_cfg["logs"].Split(",");
+
+        for (unsigned int i = 0; i < logs.size(); i++) {
+            if (m_cfg[logs[i] + ".db"] != "(null)") {
+                m_dbs[logs[i]] = bwdb_load(m_cfg[logs[i] + ".db"]);
+            }
+        }
+    }
+}
+
+void BWKSLogger::run() {
+    while (true) {
+		try {
+			SyncLogs();
+		}
+		catch (BWError &e) {
+			m_log(BWLog::MSG_INFO) << "Erro ao sincronizar logs: " 
+								<< e.GetErrorMessage() << bwlog::endl;
+		}
+
+        exec_sleep(m_cfg["logtime"].GetInt());
+    }
+}
+
+void BWKSLogger::SyncLogs() {
+    BWList sections;
+
+    m_log(BWLog::MSG_DEBUG) << "Iniciando sincronia de logs" << bwlog::endl;
+
+    if (m_cfg["logs"] != "(null)" && m_cfg["logs"] != "") {    
+        sections = m_cfg["logs"].Split(",");
+
+        for (unsigned int i = 0; i < sections.size(); i++) {
+            try {
+                syncSection(sections[i]);
+            } 
+            catch (BWError &e) {
+                m_log(BWLog::MSG_ERROR) << "Erro ao sincronizar sessao: " 
+                                        << e.GetErrorMessage() << bwlog::endl;
+                rollbackTransaction(sections[i]);
+                m_transaction->Disconnect();
+            }
+        }
+    }
+}
+
+void BWKSLogger::syncSection(const BWString &sec) {
+    BWList tables;
+
+    m_log(BWLog::MSG_DEBUG) << "Sincronizando sessao: " << sec << bwlog::endl;
+
+    tables = m_cfg[sec + ".tabelas"].Split(",");
+
+    if (!m_transaction->DoConnect()) {
+        return;
+    }
+	
+    // Iniciar transacao com o banco do KeepSync
+    m_ksdb->BeginTransaction();
+    
+
+    m_transaction->BeginLogs(sec);
+
+    for (unsigned int i = 0; i < tables.size(); i++) {
+        syncTables(sec, tables[i]);
+    }
+
+    // Tratar erros na finalizacao
+    m_transaction->EndLogs(sec);
+	
+    beginTransaction(sec);
+    cleanLogs(sec);
+    commitTransaction(sec);
+
+    m_transaction->Disconnect();
+}
+
+void BWKSLogger::syncTables(const BWString &sec, const BWString &table) {
+    BWResultSet rset;
+    BWKeyPair tuple;
+    BWKeyPair kpr;
+    BWKeyPair rsp;
+    BWString fields = m_cfg[sec + "." + table + ".campos"];
+    BWString idfield = m_cfg[sec + "." + table + ".idfield"];
+    BWString stfield = m_cfg[sec + "." + table + ".status"];
+    BWString bquery = "SELECT " + fields;
+    BWString equery;
+    BWString dynid = m_cfg[sec + "." + table + ".iddinamico"];
+    BWString tmp;
+    int max = m_cfg["offset"].GetInt();
+    int offset = 0;
+    int count = 0;
+
+    if (dynid == "(null)") {
+        dynid = "false";
+    }
+
+    if (stfield != "(null)") {
+        bquery += "," + stfield;
+    }
+
+    if (idfield == "(null)") {
+        idfield = "id";
+    }
+
+    m_log(BWLog::MSG_DEBUG) << "Sincronizando tabela: " << table << bwlog::endl;
+
+	
+    bquery += "," + idfield + " AS idvalue FROM " + table + " WHERE " + idfield + " > ";
+
+    if (m_cfg["dontremove"] == "S") {
+        equery += " AND (status <> 'R' OR status IS NULL)";
+    }
+
+    equery += " ORDER BY " + idfield + " LIMIT ";
+    equery.AppendInt(max);
+
+    do {
+        tmp = bquery;
+        tmp.AppendInt(offset);
+        tmp += equery;
+		
+        m_log(BWLog::MSG_XDEBUG) << "Query: " << tmp << bwlog::endl;
+
+        if (m_dbs[sec]) {
+            rset = m_dbs[sec]->ExecuteQuery(tmp);
+        }
+        else {
+            rset = m_appdb->ExecuteQuery(tmp);
+        }
+
+		m_log(BWLog::MSG_XDEBUG) << "Num Rows: " << rset.GetNumRows() << bwlog::endl;
+		
+        if (rset.GetNumRows() == 0) {
+            break;
+        }
+
+        do {
+            kpr.clear();
+			
+            offset = rset.GetInt("idvalue");
+
+            kpr["section"] = sec;
+            kpr["table"] = table;
+            kpr["fields"] = fields;
+            kpr["dynid"] = dynid;
+            kpr["idfield"] = idfield;
+            kpr["idvalue"] = rset.GetString("idvalue");
+
+            tuple = rset.GetTuple();
+            kpr.AppendKeyPair(tuple);
+			
+            m_log(BWLog::MSG_DEBUG) << "syncTables::kpr: " << kpr.ToString() << bwlog::endl;
+			
+            m_log(BWLog::MSG_XDEBUG) << "Chamando syncRegister" << bwlog::endl;
+
+            if (syncRegister(kpr)) {
+                count++;
+            }
+
+        } while (rset.Next());
+
+        if (rset.GetNumRows() == max) {
+            if (count > 0) {
+                kpr.clear();
+                kpr["action"] = "cont";
+
+                rsp = m_transaction->Chat(kpr);
+			
+                if (rsp["status"] != "OK") {
+                    throw BWError(APP_ERROR, 
+                                  "Erro ao sincronizar registros (offset)");
+                }
+                count = 0;
+            }
+			
+            //offset += max;
+        }
+
+    } while (rset.GetNumRows() == max);
+
+}
+
+bool BWKSLogger::syncRegister(BWKeyPair data) {
+    BWKeyPair kpr;
+    BWString remid;
+    BWKeyPair kpref;
+    BWString stfield;
+    bool ret = false;
+
+    m_log(BWLog::MSG_DEBUG) << "Sincronizando registro..." << bwlog::endl;
+
+    stfield = m_cfg[data["section"] + "." + data["table"] + ".status"];
+    
+    if (m_cfg[data["section"] + "." + data["table"] + 
+              ".referencias"] != "(null)") {
+        kpref = getRelationsId(data);
+        
+        if (kpref.empty()) {
+            return ret;
+        }
+        
+        data.AppendKeyPair(kpref);
+    }
+
+    if (data["dynid"] == "true") {
+        m_log(BWLog::MSG_XDEBUG) << "Id Dinamico..." << bwlog::endl;
+	
+        remid = getTranslatedId(data["table"], data["idfield"], 
+                                data["idvalue"]);
+
+        if (remid != "") {
+            data["action"] = "update";
+            data["id"] = remid;
+        }
+
+        if (remid == "" || data[stfield] == "S") {
+            kpr = m_transaction->Chat(data);
+            
+            if (kpr["status"] == "ERR") {
+                throw BWError(APP_ERROR, "Erro ao sincronizar dados com servidor");
+            }
+            
+            ret = true;
+
+            // Grava as informacoes dos registros replicados
+            // para posterior remocao
+            if (data[stfield] == "S") {
+                writeReplicatedData(data["section"], data["table"], 
+                                    data["idfield"], data["idvalue"], "C");
+            }
+        }
+        
+        if (remid == "" && kpr["id"] != "(null)") {
+            writeTranslatedId(data["table"], data["idfield"], 
+                              data["idvalue"], kpr["id"]);
+        }
+    }
+    else {
+        m_log(BWLog::MSG_XDEBUG) << "Id nao eh dinamico" << bwlog::endl;
+        m_transaction->SendLog(data);
+        ret = true;
+        
+        // Grava as informacoes dos registro replicados, para posterior
+        // remocao
+        writeReplicatedData(data["section"], data["table"], 
+                            data["idfield"], data["idvalue"], "C");
+    }
+    
+    // A remocao dos logs agora se da no final da replicacao
+    // a fim de evitar a necessidade de uma transacao e os
+    // consequentes locks no SQLite
+    // if (stfield == "(null)" || data[stfield] == "S") {
+    //    cleanLogs(data);
+    //}
+	
+    return ret;
+}
+
+BWKeyPair BWKSLogger::getRelationsId(BWKeyPair data) {
+    BWString ref;
+    BWList lref;
+    BWKeyPair ret;
+    BWString table;
+    BWString idfield;
+    BWString rval;
+
+    ref = m_cfg[data["section"] + "." + data["table"] + ".referencias"]; 
+    lref = ref.Split(",");
+
+    for (unsigned int i = 0; i < lref.size(); i++) {
+        table = m_cfg[data["section"] + "." + data["table"] + "." + 
+                      lref[i] + ".tabela"];
+        idfield = m_cfg[data["section"] + "." + data["table"] + "." +
+                      lref[i] + ".campo"];
+                      
+        rval = getTranslatedId(table, idfield, data[lref[i]]);
+        
+        // Se nao encontrar o ID traduzido, significa que a referencia
+        // ainda nao foi replicada, e portanto, nao devemos replicar o
+        // registro ainda.
+        if (rval == "") {
+            ret.clear();
+            return ret;
+        }
+
+        ret[lref[i]] = rval;
+
+        // Incrementa o numero de referencias
+        // changeReference(table, idfield, data[lref[i]], true);
+    }
+
+    return ret;
+}
+
+void BWKSLogger::cleanLogs(const BWString &sec) {
+    BWResultSet rset;
+    BWString query = "SELECT tabela, campo, valor FROM bw_ksreplicado ";
+    BWKeyPair where;
+    BWKeyPair record;
+    
+    query += "WHERE status = 'C' AND sessao = '" + sec + "'";
+    
+    m_log(BWLog::MSG_DEBUG) << "cleanLogs: Executando Query: " << 
+                            query << bwlog::endl;
+    
+    rset = m_ksdb->ExecuteQuery(query);
+    
+    if (rset.GetNumRows() == 0) {
+        return;
+    }
+    
+    do {
+        where.clear();
+        where[rset.GetString("campo")] = rset.GetString("valor");
+        
+        m_log(BWLog::MSG_XDEBUG) << "cleanLogs: Removendo registro: " << 
+                                where.ToString() << bwlog::endl;
+       
+        // Caso esteja parametrizado para nao remover logs
+        if (m_cfg["dontremove"] == "S") { 
+            record["status"] = "R";
+            if (m_dbs[sec]) {
+                m_dbs[sec]->Update(rset.GetString("tabela"), record, where);
+            }
+            else {
+                m_appdb->Update(rset.GetString("tabela"), record, where);
+            }  
+        }
+        else {
+            if (m_dbs[sec]) {
+                m_dbs[sec]->Delete(rset.GetString("tabela"), where);
+            }
+            else {
+                m_appdb->Delete(rset.GetString("tabela"), where);
+            }
+        }
+        
+        m_log(BWLog::MSG_XDEBUG) << "cleanLogs: Removendo replicados: " << 
+                                where.ToString() << bwlog::endl;
+        
+        where.clear();
+        where["sessao"] = sec;
+        where["tabela"] = rset.GetString("tabela");
+        where["campo"] = rset.GetString("campo");
+        where["valor"] = rset.GetString("valor");
+        where["status"] = "C";
+        
+        m_ksdb->Delete("bw_ksreplicado", where);
+        
+        where.clear();
+        where["tabela"] = rset.GetString("tabela");
+        where["campo"] = rset.GetString("campo");
+        where["valorlocal"] = rset.GetString("valor");
+        
+        m_ksdb->Delete("bw_kstradutor", where);
+        
+    } while (rset.Next());
+}
+
+BWString BWKSLogger::getTranslatedId(const BWString &table,
+                     const BWString &idfield, const BWString &idvalue) {
+    BWResultSet rset;
+    BWString query = "SELECT valorremoto FROM bw_kstradutor WHERE ";
+
+    query += "tabela = '" + table + "' AND campo = '" + idfield + "' ";
+    query += "AND valorlocal = '" + idvalue + "'";
+
+    rset = m_ksdb->ExecuteQuery(query);
+
+    if (rset.GetNumRows() <= 0) {
+        return "";
+    }
+
+    return rset.GetString("valorremoto");    
+}
+
+void BWKSLogger::writeTranslatedId(const BWString &table,
+                 const BWString &idfield, const BWString &lid,
+                 const BWString &rid) {
+    BWKeyPair data;
+
+    data["tabela"] = table;
+    data["campo"] = idfield;
+    data["valorlocal"] = lid;
+    data["valorremoto"] = rid;
+    // data["ref"] = "0";
+
+    m_ksdb->Insert("bw_kstradutor", data);
+}
+
+void BWKSLogger::writeReplicatedData(const BWString &sec, 
+                const BWString &table, const BWString &idfield, 
+                const BWString &idvalue, const BWString &status) {
+    BWKeyPair record;
+    
+    record["sessao"] = sec;
+    record["tabela"] = table;
+    record["campo"] = idfield;
+    record["valor"] = idvalue;
+    record["status"] = status;
+    
+    m_log(BWLog::MSG_XDEBUG) << "writeReplicatedData: " << record.ToString() << bwlog::endl;
+    
+    m_ksdb->Insert("bw_ksreplicado", record);
+}
+
+void BWKSLogger::beginTransaction(const BWString &sec) {
+    m_log(BWLog::MSG_DEBUG) << "Iniciando transacao no banco de dados" 
+                            << bwlog::endl;
+
+    if (m_dbs[sec]) {
+        m_dbs[sec]->BeginTransaction();
+    }
+    else {
+        m_appdb->BeginTransaction();
+    }
+
+    // m_ksdb->BeginTransaction();
+}
+
+void BWKSLogger::commitTransaction(const BWString &sec) {
+    m_log(BWLog::MSG_DEBUG) << "Fazendo commit em banco de dados" 
+                            << bwlog::endl;
+
+    if (m_dbs[sec]) {
+        m_dbs[sec]->Commit();
+    }
+    else {
+        m_appdb->Commit();
+    }
+
+    m_ksdb->Commit();
+}
+
+void BWKSLogger::rollbackTransaction(const BWString &sec) {
+    m_log(BWLog::MSG_DEBUG) << "Fazendo rollback em banco de dados" 
+                            << bwlog::endl;
+
+    if (m_dbs[sec]) {
+        m_dbs[sec]->Rollback();
+    }
+    else {
+        m_appdb->Rollback();
+    }
+
+    m_ksdb->Rollback();
+}
+/*
+void BWKSLogger::changeReference(const BWString &tabela, 
+                const BWString &campo, const BWString &valor, bool inc) {
+
+    BWString query = "SELECT ref FROM bw_kstradutor WHERE ";
+    BWResultSet rset;
+    BWKeyPair record;
+    BWKeyPair where;
+    int nref;
+    
+    query += "tabela = '" + tabela + "' AND campo = '" + campo;
+    query += "' AND valorlocal = '" + valor + "'";
+    
+    rset = m_ksdb->ExecuteQuery(query);
+    
+    if (rset.GetNumRows() > 0) {
+        nref = rset.GetInt("ref");
+        
+        if (nref > 0) {
+            if (inc) {
+                nref++;
+            }
+            else {
+                nref--;
+            }
+        }
+        
+        record["ref"] = BWString("").AppendInt(nref);
+        where["tabela"] = tabela;
+        where["campo"] = campo;
+        where["valorlocal"] = valor;
+        
+        m_ksdb->Update("bw_kstradutor", record, where);
+    }
+}
+
+// incompleto - finalizar se precisar utilizar
+void BWKSLogger::decReferences(const BWString &sec, const BWString &tabela, 
+                                const BWString &campo, const BWString &valor) {
+    BWString ref;
+    BWList lref;
+    
+    
+    
+    BWString table;
+    BWString idfield;
+    BWKeyPair record;
+    BWKeyPair where;
+    BWString rval;
+
+    ref = m_cfg[sec + "." + tabela + ".referencias"]; 
+    lref = ref.Split(",");
+
+    for (unsigned int i = 0; i < lref.size(); i++) {
+        table = m_cfg[sec + "." + tabela + "." + 
+                      lref[i] + ".tabela"];
+        idfield = m_cfg[sec + "." + tabela + "." +
+                      lref[i] + ".campo"];
+                      
+        rval = getTranslatedId(table, idfield, data[lref[i]]);
+        
+        // Se nao encontrar o ID traduzido, significa que a referencia
+        // ainda nao foi replicada, e portanto, nao devemos replicar o
+        // registro ainda.
+        if (rval == "") {
+            ret.clear();
+            return ret;
+        }
+
+        ret[lref[i]] = rval;
+
+        // Incrementa o numero de referencias
+        changeReference(table, idfield, data[lref[i]], true);
+
+        m_ksdb->Update("bw_kstradutor", record, where);
+    }
+}
+*/
+
